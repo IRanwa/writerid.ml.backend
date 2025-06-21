@@ -3,7 +3,10 @@ uvicorn==0.24.0
 requests==2.31.0
 azure-storage-blob==12.17.0
 python-dotenv==1.0.0
-torch==2.1.0
-torchvision==0.16.0
+# PyTorch with CUDA support - install with: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+torch==2.7.1
+torchvision==0.20.1
 pydantic==2.5.2
-pillow 
+pillow==10.1.0
+numpy==1.24.3
+urllib3==2.1.0 

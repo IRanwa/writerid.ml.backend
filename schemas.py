@@ -23,4 +23,23 @@ class Prediction(BaseModel):
 class PredictionResponse(BaseModel):
     task_id: str
     query_image: str
-    prediction: Prediction 
+    prediction: Prediction
+
+class TaskExecutionInfo(BaseModel):
+    taskId: str
+    taskContainerName: str
+    datasetContainerName: str
+    modelContainerName: Optional[str]
+    useDefaultModel: bool
+    selectedWriters: List[str]
+    queryImageFileName: str
+    status: str
+
+class TaskExecutionRequest(BaseModel):
+    task_id: str
+
+class TaskExecutionResponse(BaseModel):
+    task_id: str
+    query_image: str
+    prediction: Prediction
+    status: str 
