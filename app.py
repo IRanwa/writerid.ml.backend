@@ -75,18 +75,21 @@ class PredictionService:
         print(f"PredictionService initialized with device: {self.device}")
         
         try:
-            self.image_processor = ImageProcessor(device=self.device)
+            # Initialize with grayscale (1 channel) for writer identification
+            self.image_processor = ImageProcessor(device=self.device, input_channels=1)
             self.azure_client = AzureStorageClient()
         except Exception as e:
             print(f"Error initializing services: {e}")
             raise
 
     def initialize_model(self, backbone_name: str = "googlenet", pretrained: bool = True) -> None:
-        """Initialize a new model with specified backbone"""
+        """Initialize a new model with specified backbone (grayscale input)"""
         try:
-            print(f"Initializing model with backbone: {backbone_name}")
+            print(f"Initializing model with backbone: {backbone_name} for grayscale input")
             self.model = PrototypicalNetwork(backbone_name=backbone_name, pretrained=pretrained, device=self.device)
             self.model.to(self.device)
+            
+            # Image processor is already initialized for grayscale (1 channel)
             
             if self.device.type == 'cuda' and torch.cuda.device_count() > 1:
                 print("Using DataParallel for multi-GPU setup")
@@ -112,18 +115,12 @@ class PredictionService:
             else:
                 state_dict = torch.load(model_path, map_location='cpu')
             
-            # Detect input channels from the first conv layer
-            input_channels = 3  # default
-            for key, value in state_dict.items():
-                if 'conv1' in key and 'weight' in key and value.dim() == 4:
-                    input_channels = value.shape[1]
-                    print(f"Detected {input_channels} input channels from saved model")
-                    break
-            
-            # Initialize with the detected input channels
-            print(f"Initializing model with backbone: googlenet and {input_channels} input channels")
-            self.model = PrototypicalNetwork(backbone_name="googlenet", pretrained=True, device=self.device, input_channels=input_channels)
+            # Initialize with grayscale input (1 channel)
+            print(f"Initializing model with backbone: googlenet for grayscale input")
+            self.model = PrototypicalNetwork(backbone_name="googlenet", pretrained=True, device=self.device)
             self.model.to(self.device)
+            
+            # Image processor is already initialized for grayscale (1 channel)
             
             if self.device.type == 'cuda' and torch.cuda.device_count() > 1:
                 print("Using DataParallel for multi-GPU setup")
@@ -147,7 +144,7 @@ class PredictionService:
             raise
 
     @torch.no_grad()
-    def evaluate_task(self, support_images_paths: list[str], query_image_path: str) -> tuple[int, float]:
+    def evaluate_task(self, support_images_paths: list[str], query_image_path: str, support_labels: list[int] = None) -> tuple[int, float]:
         """Evaluate a single task using the prototypical network approach"""
         if self.model is None:
             raise ValueError("Model not initialized. Call load_model or initialize_model first.")
@@ -157,23 +154,41 @@ class PredictionService:
             
             # Process support images
             support_images = self.image_processor.preprocess_images(support_images_paths)
-            support_labels = torch.arange(len(support_images_paths), device=self.device)
+            
+            # Process support labels
+            if support_labels is None:
+                # Default: each image is its own class
+                support_labels = torch.arange(len(support_images_paths), device=self.device, dtype=torch.long)
+            else:
+                # Convert list to tensor with long dtype
+                support_labels = torch.tensor(support_labels, dtype=torch.long, device=self.device)
             
             # Process query image
             query_tensor = self.image_processor.preprocess_image(query_image_path)
             
             print(f"Support images shape: {support_images.shape}")
+            print(f"Support labels: {support_labels}")
+            print(f"Support labels type: {type(support_labels)}")
+            print(f"Support labels values: {support_labels.tolist() if hasattr(support_labels, 'tolist') else support_labels}")
             print(f"Query image shape: {query_tensor.shape}")
             print(f"Using device: {self.device}")
             
-            # Get predictions
+            # Get predictions using the new forward signature
             scores = self.model(support_images, support_labels, query_tensor)
+            print(f"Scores shape: {scores.shape}, Scores: {scores}")
             
             # Convert scores to probabilities and get predictions
             probabilities = torch.softmax(scores, dim=1)
+            print(f"Probabilities shape: {probabilities.shape}, Probabilities: {probabilities}")
             predicted_label = torch.argmax(probabilities, dim=1).item()
-            confidence = probabilities[0][predicted_label].item()
+            print(f"Predicted label: {predicted_label}")
             
+            # Defensive: check if predicted_label is in range
+            if probabilities.shape[1] <= predicted_label:
+                print(f"Warning: predicted_label {predicted_label} is out of range for probabilities shape {probabilities.shape}")
+                confidence = float('nan')
+            else:
+                confidence = probabilities[0][predicted_label].item()
             print(f"Prediction: label={predicted_label}, confidence={confidence:.4f}")
             
             if self.device.type == 'cuda':
@@ -316,7 +331,7 @@ async def predict(request: TaskRequest) -> PredictionResponse:
             
             # 2. Download query image
             query_image_path = os.path.join(task_work_dir, execution_info.queryImageFileName)
-            query_blob_path = f"query/{execution_info.queryImageFileName}"
+            query_blob_path = f"{execution_info.queryImageFileName}"
             prediction_service.azure_client.download_file(
                 execution_info.taskContainerName,
                 query_blob_path,
@@ -330,7 +345,7 @@ async def predict(request: TaskRequest) -> PredictionResponse:
             
             for writer_id in execution_info.selectedWriters:
                 writer_folder = os.path.join(writers_dir, f"writer_{writer_id}")
-                writer_blob_path = f"writers/{writer_id}"
+                writer_blob_path = f"{writer_id}"
                 
                 # Download writer's sample images
                 sample_images = prediction_service.azure_client.download_folder(
@@ -350,20 +365,34 @@ async def predict(request: TaskRequest) -> PredictionResponse:
                 raise HTTPException(status_code=400, detail="No valid writer samples found for selected writers")
             
             # 4. Perform prediction using prototypical network
-            # Use first sample from each writer for support set
+            # Use up to 5 samples from each writer for support set
             support_image_paths = []
+            support_labels = []
             writer_ids_order = []
             
-            for sample in writer_samples:
-                if sample['sample_paths']:
-                    support_image_paths.append(sample['sample_paths'][0])
-                    writer_ids_order.append(sample['writer_id'])
+            for writer_idx, sample in enumerate(writer_samples):
+                writer_id = sample['writer_id']
+                sample_paths = sample['sample_paths']
+                
+                # Use up to 5 samples from each writer
+                num_samples = min(5, len(sample_paths))
+                selected_samples = sample_paths[:num_samples]
+                
+                for sample_path in selected_samples:
+                    support_image_paths.append(sample_path)
+                    support_labels.append(writer_idx)  # Use writer_idx as class label
+                
+                writer_ids_order.append(writer_id)
+                print(f"Added {num_samples} support images for writer {writer_id} (class {writer_idx})")
             
             if not support_image_paths:
                 raise HTTPException(status_code=400, detail="No support images available")
             
+            print(f"Total support images: {len(support_image_paths)} from {len(writer_ids_order)} writers")
+            print(f"Support labels: {support_labels}")
+            
             # Evaluate the task
-            predicted_idx, confidence = prediction_service.evaluate_task(support_image_paths, query_image_path)
+            predicted_idx, confidence = prediction_service.evaluate_task(support_image_paths, query_image_path, support_labels)
             
             # Map prediction index back to writer ID
             predicted_writer = writer_ids_order[predicted_idx] if 0 <= predicted_idx < len(writer_ids_order) else None

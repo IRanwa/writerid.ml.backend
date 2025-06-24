@@ -12,6 +12,7 @@ class AzureStorageClient:
         self.connection_string = config.AZURE_CONNECTION_STRING
         print(f"Azure Connection String configured: {len(self.connection_string)} characters")
         
+        # Check if we should use mock mode first
         self.use_mock = self._should_use_mock()
         
         if self.use_mock:
@@ -19,6 +20,13 @@ class AzureStorageClient:
             self.blob_service_client = None
         else:
             try:
+                # Validate connection string format before creating client
+                if not self._is_valid_connection_string(self.connection_string):
+                    print("Invalid Azure connection string format, falling back to mock mode")
+                    self.use_mock = True
+                    self.blob_service_client = None
+                    return
+                
                 self.blob_service_client = BlobServiceClient.from_connection_string(self.connection_string)
                 print("Azure Storage client initialized successfully")
             except Exception as e:
@@ -27,13 +35,43 @@ class AzureStorageClient:
                 self.use_mock = True
                 self.blob_service_client = None
 
+    def _is_valid_connection_string(self, connection_string: str) -> bool:
+        """Validate that the connection string has the required components"""
+        if not connection_string:
+            return False
+        
+        required_components = ['DefaultEndpointsProtocol', 'AccountName', 'AccountKey', 'EndpointSuffix']
+        connection_string_lower = connection_string.lower()
+        
+        for component in required_components:
+            if component.lower() not in connection_string_lower:
+                return False
+        
+        # Check for test/mock indicators - if any are found, consider it invalid
+        test_indicators = ['accountname=test', 'accountkey=test', 'accountname=dev', 'accountkey=dev']
+        if any(indicator in connection_string_lower for indicator in test_indicators):
+            return False
+            
+        return True
+
     def _should_use_mock(self) -> bool:
         if not self.connection_string:
             return True
         
-        if (self.connection_string.startswith('DefaultEndpointsProtocol=https;AccountName=test') or
-            'AccountName=test' in self.connection_string or
-            len(self.connection_string) < 50):
+        # Check for test/mock connection strings
+        connection_string_lower = self.connection_string.lower()
+        
+        # Check for test account names or keys
+        if any(indicator in connection_string_lower for indicator in ['accountname=test', 'accountkey=test']):
+            return True
+        
+        # Check for short connection strings (likely test data)
+        if len(self.connection_string) < 100:
+            return True
+        
+        # Check if it's the default test connection string
+        default_test = 'defaultendpointsprotocol=https;accountname=test;accountkey=test;endpointsuffix=core.windows.net'
+        if connection_string_lower == default_test:
             return True
         
         return False
@@ -41,7 +79,10 @@ class AzureStorageClient:
     def download_file(self, container_name: str, blob_name: str, destination: str) -> None:
         print(f"Downloading {blob_name} from container {container_name} to {destination}")
         
-        os.makedirs(os.path.dirname(destination), exist_ok=True)
+        # Create directory if it doesn't exist (only if destination has a directory path)
+        destination_dir = os.path.dirname(destination)
+        if destination_dir:
+            os.makedirs(destination_dir, exist_ok=True)
         
         if self.use_mock:
             self._download_file_mock(container_name, blob_name, destination)
@@ -64,28 +105,28 @@ class AzureStorageClient:
                 file_size = properties.size
                 print(f"File size: {file_size / (1024*1024):.2f} MB")
                 
-                if file_size < 10 * 1024 * 1024:
-                    print("Using direct download for small file")
-                    with open(destination, "wb") as file:
-                        download_stream = blob_client.download_blob()
-                        file.write(download_stream.readall())
-                else:
-                    print("Using streaming download for large file")
-                    with open(destination, "wb") as file:
-                        download_stream = blob_client.download_blob()
+                # if file_size < 10 * 1024 * 1024:
+                #     print("Using direct download for small file")
+                #     with open(destination, "wb") as file:
+                #         download_stream = blob_client.download_blob()
+                #         file.write(download_stream.readall())
+                # else:
+                print("Using streaming download for large file")
+                with open(destination, "wb") as file:
+                    download_stream = blob_client.download_blob()
+                    
+                    bytes_downloaded = 0
+                    chunk_size = 1024 * 1024  # 1 MB chunks
+                    
+                    while True:
+                        chunk = download_stream.read(chunk_size)
+                        if not chunk:
+                            break
+                        file.write(chunk)
+                        bytes_downloaded += len(chunk)
                         
-                        bytes_downloaded = 0
-                        chunk_size = 1024 * 1024
-                        
-                        while True:
-                            chunk = download_stream.readall(chunk_size)
-                            if not chunk:
-                                break
-                            file.write(chunk)
-                            bytes_downloaded += len(chunk)
-                            
-                            progress = (bytes_downloaded / file_size) * 100
-                            print(f"Download progress: {progress:.1f}% ({bytes_downloaded / (1024*1024):.1f}/{file_size / (1024*1024):.1f} MB)")
+                        progress = (bytes_downloaded / file_size) * 100
+                        print(f"Download progress: {progress:.1f}% ({bytes_downloaded / (1024*1024):.1f}/{file_size / (1024*1024):.1f} MB)")
                 
                 print(f"Successfully downloaded {blob_name} ({file_size / (1024*1024):.2f} MB)")
                 return
@@ -163,26 +204,30 @@ class AzureStorageClient:
             return self._download_folder_mock(container_name, folder_path, destination_folder)
         
         try:
+            import random
             container_client = self.blob_service_client.get_container_client(container_name)
-            blobs = container_client.list_blobs(name_starts_with=folder_path)
+            blobs = list(container_client.list_blobs(name_starts_with=folder_path))
+            
+            # Filter only image blobs
+            image_blobs = [blob for blob in blobs if blob.name.lower().endswith((".png", ".jpg", ".jpeg"))]
+            
+            # Randomly select up to 5 images
+            selected_blobs = random.sample(image_blobs, min(5, len(image_blobs)))
             
             downloaded_files = []
-            for blob in blobs:
-                if blob.name.lower().endswith(('.png', '.jpg', '.jpeg')):
-                    file_path = os.path.join(destination_folder, os.path.basename(blob.name))
-                    
-                    try:
-                        blob_client = container_client.get_blob_client(blob.name)
-                        with open(file_path, "wb") as file:
-                            blob_data = blob_client.download_blob()
-                            file.write(blob_data.readall())
-                        downloaded_files.append(file_path)
-                        print(f"Downloaded: {blob.name}")
-                    except Exception as e:
-                        print(f"Failed to download {blob.name}: {e}")
-                        
+            for blob in selected_blobs:
+                file_path = os.path.join(destination_folder, os.path.basename(blob.name))
+                try:
+                    blob_client = container_client.get_blob_client(blob.name)
+                    with open(file_path, "wb") as file:
+                        blob_data = blob_client.download_blob()
+                        file.write(blob_data.readall())
+                    downloaded_files.append(file_path)
+                    print(f"Downloaded: {blob.name}")
+                except Exception as e:
+                    print(f"Failed to download {blob.name}: {e}")
             return downloaded_files
-            
+        
         except Exception as e:
             print(f"Error downloading folder {folder_path}: {e}")
             print("Falling back to mock download")
