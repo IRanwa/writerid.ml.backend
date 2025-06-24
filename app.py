@@ -73,84 +73,62 @@ class PredictionService:
         self.model = None
         self.device = setup_device()
         print(f"PredictionService initialized with device: {self.device}")
-        
         try:
-            # Initialize with grayscale (1 channel) for writer identification
-            self.image_processor = ImageProcessor(device=self.device, input_channels=1)
+            self.image_processor = ImageProcessor(device=self.device)
             self.azure_client = AzureStorageClient()
         except Exception as e:
             print(f"Error initializing services: {e}")
             raise
 
     def initialize_model(self, backbone_name: str = "googlenet", pretrained: bool = True) -> None:
-        """Initialize a new model with specified backbone (grayscale input)"""
         try:
             print(f"Initializing model with backbone: {backbone_name} for grayscale input")
             self.model = PrototypicalNetwork(backbone_name=backbone_name, pretrained=pretrained, device=self.device)
             self.model.to(self.device)
-            
-            # Image processor is already initialized for grayscale (1 channel)
-            
             if self.device.type == 'cuda' and torch.cuda.device_count() > 1:
                 print("Using DataParallel for multi-GPU setup")
                 self.model = torch.nn.DataParallel(self.model)
-            
             self.model.eval()
-            
             if self.device.type == 'cuda':
                 print(f"Model moved to GPU. Memory allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
-            
         except Exception as e:
             print(f"Error initializing model: {e}")
             raise
 
     def load_model(self, model_path: str) -> None:
-        """Load a saved model from path"""
         try:
             print(f"Loading model from: {model_path}")
-            
-            # Load the saved state dict to inspect it
             if self.device.type == 'cuda':
                 state_dict = torch.load(model_path, map_location=self.device)
             else:
                 state_dict = torch.load(model_path, map_location='cpu')
-            
-            # Initialize with grayscale input (1 channel)
             print(f"Initializing model with backbone: googlenet for grayscale input")
             self.model = PrototypicalNetwork(backbone_name="googlenet", pretrained=True, device=self.device)
             self.model.to(self.device)
-            
-            # Image processor is already initialized for grayscale (1 channel)
-            
             if self.device.type == 'cuda' and torch.cuda.device_count() > 1:
                 print("Using DataParallel for multi-GPU setup")
                 self.model = torch.nn.DataParallel(self.model)
-            
             self.model.eval()
-            
-            # Use flexible loading
             if hasattr(self.model, 'module'):
-                # Handle DataParallel wrapper
                 self.model.module.load_state_dict_flexible(state_dict, strict=False)
             else:
                 self.model.load_state_dict_flexible(state_dict, strict=False)
-            
             print(f"Model loaded successfully on {self.device}")
             if self.device.type == 'cuda':
                 print(f"GPU memory allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
-                
         except Exception as e:
             print(f"Error loading model: {e}")
             raise
 
     @torch.no_grad()
-    def evaluate_task(self, support_images_paths: list[str], query_image_path: str, support_labels: list[int] = None) -> tuple[int, float]:
+    def evaluate_task(self, support_images_paths: list[str], query_image_path: str, support_labels: list[int] = None, rejection_threshold: float = 15.0) -> tuple[int, float]:
         """Evaluate a single task using the prototypical network approach"""
         if self.model is None:
             raise ValueError("Model not initialized. Call load_model or initialize_model first.")
         
         try:
             print(f"Evaluating task with {len(support_images_paths)} support images")
+            print(f"Using rejection threshold: {rejection_threshold}")
             
             # Process support images
             support_images = self.image_processor.preprocess_images(support_images_paths)
@@ -173,23 +151,41 @@ class PredictionService:
             print(f"Query image shape: {query_tensor.shape}")
             print(f"Using device: {self.device}")
             
-            # Get predictions using the new forward signature
-            scores = self.model(support_images, support_labels, query_tensor)
+            # Get predictions using the new forward signature with rejection threshold
+            scores = self.model.forward(support_images, support_labels, query_tensor, rejection_threshold=rejection_threshold)
             print(f"Scores shape: {scores.shape}, Scores: {scores}")
             
             # Convert scores to probabilities and get predictions
             probabilities = torch.softmax(scores, dim=1)
             print(f"Probabilities shape: {probabilities.shape}, Probabilities: {probabilities}")
-            predicted_label = torch.argmax(probabilities, dim=1).item()
-            print(f"Predicted label: {predicted_label}")
             
-            # Defensive: check if predicted_label is in range
-            if probabilities.shape[1] <= predicted_label:
-                print(f"Warning: predicted_label {predicted_label} is out of range for probabilities shape {probabilities.shape}")
-                confidence = float('nan')
+            # Check if the prediction was rejected
+            max_prob = torch.max(probabilities, dim=1).values.item()
+            predicted_label = torch.argmax(probabilities, dim=1).item()
+            
+            # If the maximum probability is very low (due to rejection), mark as rejected
+            if max_prob < 0.01:  # Very low probability indicates rejection
+                print(f"PREDICTION REJECTED: Query image doesn't match any known writer well")
+                print(f"Maximum probability: {max_prob:.6f} (below rejection threshold)")
+                predicted_label = -1  # Special value for rejected predictions
+                confidence = 0.0
             else:
-                confidence = probabilities[0][predicted_label].item()
-            print(f"Prediction: label={predicted_label}, confidence={confidence:.4f}")
+                print(f"Predicted label: {predicted_label}")
+                # Defensive: check if predicted_label is in range
+                if probabilities.shape[1] <= predicted_label:
+                    print(f"Warning: predicted_label {predicted_label} is out of range for probabilities shape {probabilities.shape}")
+                    confidence = float('nan')
+                else:
+                    confidence = probabilities[0][predicted_label].item()
+                
+                # Check confidence threshold (75%)
+                if confidence < 0.75:
+                    print(f"CONFIDENCE TOO LOW: {confidence:.4f} < 0.75 threshold")
+                    print(f"Rejecting prediction due to low confidence")
+                    predicted_label = -1  # Mark as unknown writer
+                    confidence = 0.0
+                else:
+                    print(f"Prediction: label={predicted_label}, confidence={confidence:.4f}")
             
             if self.device.type == 'cuda':
                 # Clear GPU cache after prediction
@@ -393,6 +389,18 @@ async def predict(request: TaskRequest) -> PredictionResponse:
             
             # Evaluate the task
             predicted_idx, confidence = prediction_service.evaluate_task(support_image_paths, query_image_path, support_labels)
+            
+            # Handle rejected predictions
+            if predicted_idx == -1:
+                print(f"Prediction rejected - query image doesn't match any known writer")
+                return PredictionResponse(
+                    task_id=execution_info.taskId,
+                    query_image=execution_info.queryImageFileName,
+                    prediction=Prediction(
+                        writer_id="unknown",  # Return "unknown" as writer ID
+                        confidence=0.0  # With 0.0 confidence to indicate rejection
+                    )
+                )
             
             # Map prediction index back to writer ID
             predicted_writer = writer_ids_order[predicted_idx] if 0 <= predicted_idx < len(writer_ids_order) else None

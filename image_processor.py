@@ -2,40 +2,30 @@ import torch
 import torchvision.transforms as transforms
 from PIL import Image
 import os
-from typing import List, Union
-import numpy as np
+from typing import List
 import io
 
 class ImageProcessor:
-    def __init__(self, device: torch.device = None, input_channels: int = 1):
+    def __init__(self, device: torch.device = None):
         """
         Initialize the ImageProcessor with grayscale preprocessing transforms.
-        
         Args:
             device: PyTorch device to use for tensor operations
-            input_channels: Number of input channels expected by the model (1 for grayscale)
         """
         if device is None:
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         else:
             self.device = device
-            
-        self.input_channels = input_channels
         self.image_size = 224
-        
-        # Grayscale normalization values
         self.grayscale_mean = [0.5]
         self.grayscale_std = [0.5]
-        
-        # Transform for grayscale images (matching reference implementation)
         self.transform = transforms.Compose([
             transforms.Resize([int(self.image_size * 1.15), int(self.image_size * 1.15)]),
             transforms.CenterCrop(self.image_size),
             transforms.ToTensor(),
             transforms.Normalize(mean=self.grayscale_mean, std=self.grayscale_std)
         ])
-        
-        print(f"ImageProcessor initialized on device: {self.device} with {input_channels} input channels (grayscale)")
+        print(f"ImageProcessor initialized on device: {self.device} with 1 input channel (grayscale)")
 
     def preprocess_image(self, image_path: str) -> torch.Tensor:
         """

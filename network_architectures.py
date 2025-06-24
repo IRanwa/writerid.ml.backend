@@ -14,7 +14,7 @@ class BackboneNetworkHandler:
         self.name = name.lower()
         self.pretrained = pretrained
         self.model: nn.Module
-        self.target_channels: int = 1
+        self.target_channels: int = 1  # Always 1-channel for grayscale
         self._create_backbone()
 
     def _adapt_to_single_channel(self, model: nn.Module):
@@ -35,7 +35,7 @@ class BackboneNetworkHandler:
         original_layer = getattr(parent_module, layer_name)
         original_weights = original_layer.weight
         new_layer = nn.Conv2d(
-            in_channels=self.target_channels,
+            in_channels=1,  # Always 1-channel
             out_channels=original_layer.out_channels,
             kernel_size=original_layer.kernel_size,
             stride=original_layer.stride,
@@ -49,7 +49,7 @@ class BackboneNetworkHandler:
             if new_layer.bias is not None:
                 new_layer.bias.data = original_layer.bias.data
         setattr(parent_module, layer_name, new_layer)
-        print(f"Adapted '{self.name}' for {self.target_channels}-channel input.")
+        print(f"Adapted '{self.name}' for 1-channel input.")
 
     def _create_backbone(self):
         weights_map = {

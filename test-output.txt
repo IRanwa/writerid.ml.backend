@@ -1,3 +1,0 @@
-Mock content for test-file.txt
-Container: test-container
-Timestamp: 1750521144.7635214

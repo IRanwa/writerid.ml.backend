@@ -2,6 +2,7 @@ import torch
 from torch import nn
 from torch import Tensor
 from network_architectures import BackboneNetworkHandler
+import torch.nn.functional as F
 
 class PrototypicalNetwork(nn.Module):
     def __init__(self, backbone_name: str = "googlenet", pretrained: bool = True, device: torch.device = None, input_channels: int = 3):
@@ -47,7 +48,7 @@ class PrototypicalNetwork(nn.Module):
             else:
                 raise e
 
-    def forward(self, support_images: Tensor, support_labels: Tensor, query_images: Tensor) -> Tensor:
+    def forward(self, support_images: Tensor, support_labels: Tensor, query_images: Tensor, rejection_threshold: float = 75.0) -> Tensor:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         support_images = support_images.to(device)
         support_labels = support_labels.to(device)
@@ -88,7 +89,21 @@ class PrototypicalNetwork(nn.Module):
         dists = torch.cdist(z_query, z_proto)
         print(f"Distances shape: {dists.shape}, distances: {dists}")
         
+        # Add rejection logic based on minimum distance
+        min_distances = torch.min(dists, dim=1, keepdim=True)[0]
+        print(f"Minimum distances: {min_distances}")
+        
+        # Create rejection mask - if minimum distance is above threshold, reject
+        rejection_mask = min_distances > rejection_threshold
+        print(f"Rejection threshold: {rejection_threshold}")
+        print(f"Rejection mask: {rejection_mask}")
+        
+        # Apply rejection by setting scores to very low values for rejected queries
         scores = -dists
+        # Expand rejection mask to match scores shape for broadcasting
+        rejection_mask_expanded = rejection_mask.expand_as(scores)
+        scores[rejection_mask_expanded] = -1000.0  # Very low score for rejected queries
+        
         print(f"Scores shape: {scores.shape}, scores: {scores}")
         
         return scores
