@@ -16,15 +16,19 @@ class ImageProcessor:
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         else:
             self.device = device
+        
         self.image_size = 224
         self.grayscale_mean = [0.5]
         self.grayscale_std = [0.5]
+        
+        # Single consistent transform for all images
         self.transform = transforms.Compose([
             transforms.Resize([int(self.image_size * 1.15), int(self.image_size * 1.15)]),
             transforms.CenterCrop(self.image_size),
             transforms.ToTensor(),
             transforms.Normalize(mean=self.grayscale_mean, std=self.grayscale_std)
         ])
+        
         print(f"ImageProcessor initialized on device: {self.device} with 1 input channel (grayscale)")
 
     def preprocess_image(self, image_path: str) -> torch.Tensor:
@@ -41,7 +45,7 @@ class ImageProcessor:
             # Load image and convert to grayscale
             image = Image.open(image_path).convert('L')
             
-            # Apply transforms
+            # Apply consistent transform
             tensor = self.transform(image)
             
             # Add batch dimension
@@ -76,8 +80,9 @@ class ImageProcessor:
                 # Load image and convert to grayscale
                 image = Image.open(image_path).convert('L')
                 
-                # Apply transforms
+                # Apply consistent transform
                 tensor = self.transform(image)
+                
                 tensors.append(tensor)
             
             # Stack all tensors
@@ -106,7 +111,7 @@ class ImageProcessor:
             # Load from bytes and convert to grayscale
             image = Image.open(io.BytesIO(image_bytes)).convert('L')
             
-            # Apply transforms
+            # Apply consistent transform
             tensor = self.transform(image)
             
             # Add batch dimension
@@ -138,8 +143,9 @@ class ImageProcessor:
                 # Load from bytes and convert to grayscale
                 image = Image.open(io.BytesIO(image_bytes)).convert('L')
                 
-                # Apply transforms
+                # Apply consistent transform
                 tensor = self.transform(image)
+                
                 tensors.append(tensor)
             
             # Stack all tensors

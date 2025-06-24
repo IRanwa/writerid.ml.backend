@@ -130,7 +130,7 @@ class PredictionService:
             print(f"Evaluating task with {len(support_images_paths)} support images")
             print(f"Using rejection threshold: {rejection_threshold}")
             
-            # Process support images
+            # Process support images with consistent transforms
             support_images = self.image_processor.preprocess_images(support_images_paths)
             
             # Process support labels
@@ -141,7 +141,7 @@ class PredictionService:
                 # Convert list to tensor with long dtype
                 support_labels = torch.tensor(support_labels, dtype=torch.long, device=self.device)
             
-            # Process query image
+            # Process query image with consistent transforms
             query_tensor = self.image_processor.preprocess_image(query_image_path)
             
             print(f"Support images shape: {support_images.shape}")
