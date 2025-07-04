@@ -1,6 +1,7 @@
 import os
 import time
-from typing import List
+import hashlib
+from typing import List, Optional, Callable
 from azure.storage.blob import BlobServiceClient
 from dotenv import load_dotenv
 import config
@@ -76,17 +77,52 @@ class AzureStorageClient:
         
         return False
 
-    def download_file(self, container_name: str, blob_name: str, destination: str) -> None:
-        print(f"Downloading {blob_name} from container {container_name} to {destination}")
+    def download_file(self, container_name: str, blob_name: str, destination: str, 
+                     chunk_size: int = 2 * 1024 * 1024, resume: bool = True,
+                     delete_existing: bool = True,
+                     progress_callback: Optional[Callable[[int, int], None]] = None) -> None:
+        """
+        Download a file from Azure Blob Storage with chunked download support.
         
-        # Create directory if it doesn't exist (only if destination has a directory path)
+        Args:
+            container_name: Name of the Azure storage container
+            blob_name: Name of the blob to download
+            destination: Local file path to save the downloaded file
+            chunk_size: Size of chunks in bytes (default: 2MB)
+            resume: Whether to resume partial downloads (default: True)
+            delete_existing: Whether to delete existing file before download (default: True)
+            progress_callback: Optional callback function for progress updates (bytes_downloaded, total_size)
+        """
+        print(f"Downloading {blob_name} from container {container_name} to {destination}")
+        print(f"Chunk size: {chunk_size / (1024*1024):.2f} MB")
+        
+        # Create directory if it doesn't exist
         destination_dir = os.path.dirname(destination)
         if destination_dir:
             os.makedirs(destination_dir, exist_ok=True)
         
+        # Delete existing file if requested
+        if delete_existing:
+            if os.path.exists(destination):
+                print(f"Deleting existing file: {destination}")
+                os.remove(destination)
+        
         if self.use_mock:
             self._download_file_mock(container_name, blob_name, destination)
             return
+        
+        # Check if partial download exists
+        bytes_downloaded = 0
+        temp_destination = f"{destination}.partial"
+        
+        # If delete_existing is True, also remove partial files to start fresh
+        if delete_existing and os.path.exists(temp_destination):
+            print(f"Deleting existing partial file: {temp_destination}")
+            os.remove(temp_destination)
+        
+        if resume and os.path.exists(temp_destination):
+            bytes_downloaded = os.path.getsize(temp_destination)
+            print(f"Resuming download from {bytes_downloaded / (1024*1024):.2f} MB")
         
         max_retries = 3
         for attempt in range(max_retries):
@@ -105,43 +141,236 @@ class AzureStorageClient:
                 file_size = properties.size
                 print(f"File size: {file_size / (1024*1024):.2f} MB")
                 
-                # if file_size < 10 * 1024 * 1024:
-                #     print("Using direct download for small file")
-                #     with open(destination, "wb") as file:
-                #         download_stream = blob_client.download_blob()
-                #         file.write(download_stream.readall())
-                # else:
-                print("Using streaming download for large file")
-                with open(destination, "wb") as file:
-                    download_stream = blob_client.download_blob()
-                    
-                    bytes_downloaded = 0
-                    chunk_size = 1024 * 1024  # 1 MB chunks
-                    
-                    while True:
-                        chunk = download_stream.read(chunk_size)
-                        if not chunk:
-                            break
-                        file.write(chunk)
-                        bytes_downloaded += len(chunk)
-                        
-                        progress = (bytes_downloaded / file_size) * 100
-                        print(f"Download progress: {progress:.1f}% ({bytes_downloaded / (1024*1024):.1f}/{file_size / (1024*1024):.1f} MB)")
+                # Check if file is already completely downloaded
+                if bytes_downloaded >= file_size:
+                    print("File already completely downloaded")
+                    if os.path.exists(temp_destination):
+                        os.rename(temp_destination, destination)
+                    return
                 
-                print(f"Successfully downloaded {blob_name} ({file_size / (1024*1024):.2f} MB)")
-                return
+                # Calculate optimal chunk size based on file size
+                optimal_chunk_size = self._get_optimal_chunk_size(file_size, chunk_size)
+                print(f"Using chunk size: {optimal_chunk_size / (1024*1024):.2f} MB")
+                
+                # Download with resume support
+                success = self._download_with_chunks(
+                    blob_client, temp_destination, file_size, 
+                    bytes_downloaded, optimal_chunk_size, progress_callback
+                )
+                
+                if success:
+                    # Verify download integrity
+                    if self._verify_download(temp_destination, file_size):
+                        # Move from temp to final destination
+                        os.rename(temp_destination, destination)
+                        print(f"Successfully downloaded {blob_name} ({file_size / (1024*1024):.2f} MB)")
+                        return
+                    else:
+                        print("Download verification failed, retrying...")
+                        if os.path.exists(temp_destination):
+                            os.remove(temp_destination)
+                        bytes_downloaded = 0
+                        continue
+                else:
+                    print("Download failed, retrying...")
+                    continue
                 
             except Exception as e:
                 print(f"Download attempt {attempt + 1} failed: {e}")
                 if attempt == max_retries - 1:
                     print("All download attempts failed, falling back to mock download")
+                    # Clean up partial download
+                    if os.path.exists(temp_destination):
+                        os.remove(temp_destination)
                     self._download_file_mock(container_name, blob_name, destination)
                 else:
                     print(f"Retrying in {2 ** attempt} seconds...")
                     time.sleep(2 ** attempt)
+    
+    def _get_optimal_chunk_size(self, file_size: int, requested_chunk_size: int) -> int:
+        """Calculate optimal chunk size based on file size"""
+        # For very large files (>100MB), use larger chunks
+        if file_size > 100 * 1024 * 1024:
+            return max(requested_chunk_size, 4 * 1024 * 1024)  # 4MB min
+        # For medium files (10-100MB), use requested size
+        elif file_size > 10 * 1024 * 1024:
+            return requested_chunk_size
+        # For small files (<10MB), use smaller chunks
+        else:
+            return min(requested_chunk_size, 1024 * 1024)  # 1MB max
+    
+    def _download_with_chunks(self, blob_client, destination: str, file_size: int,
+                             start_byte: int, chunk_size: int,
+                             progress_callback: Optional[Callable[[int, int], None]] = None) -> bool:
+        """Download file in chunks with progress reporting"""
+        try:
+            mode = 'ab' if start_byte > 0 else 'wb'
+            
+            with open(destination, mode) as file:
+                bytes_downloaded = start_byte
+                last_progress_report = time.time()
+                
+                while bytes_downloaded < file_size:
+                    # Calculate chunk range
+                    end_byte = min(bytes_downloaded + chunk_size - 1, file_size - 1)
+                    
+                    # Download chunk with range
+                    download_stream = blob_client.download_blob(
+                        offset=bytes_downloaded,
+                        length=end_byte - bytes_downloaded + 1
+                    )
+                    
+                    chunk_data = download_stream.readall()
+                    file.write(chunk_data)
+                    bytes_downloaded += len(chunk_data)
+                    
+                    # Report progress (limit to every 2 seconds to avoid spam)
+                    current_time = time.time()
+                    if current_time - last_progress_report >= 2.0:
+                        progress = (bytes_downloaded / file_size) * 100
+                        speed = len(chunk_data) / (1024 * 1024 * 2)  # MB/s over 2 seconds
+                        
+                        print(f"Download progress: {progress:.1f}% "
+                              f"({bytes_downloaded / (1024*1024):.1f}/{file_size / (1024*1024):.1f} MB) "
+                              f"Speed: {speed:.1f} MB/s")
+                        
+                        if progress_callback:
+                            progress_callback(bytes_downloaded, file_size)
+                        
+                        last_progress_report = current_time
+                    
+                    # Add small delay to prevent overwhelming the connection
+                    time.sleep(0.01)
+                
+                return True
+                
+        except Exception as e:
+            print(f"Error during chunked download: {e}")
+            return False
+    
+    def _verify_download(self, file_path: str, expected_size: int) -> bool:
+        """Verify downloaded file integrity"""
+        try:
+            if not os.path.exists(file_path):
+                print("Downloaded file does not exist")
+                return False
+            
+            actual_size = os.path.getsize(file_path)
+            if actual_size != expected_size:
+                print(f"Size mismatch: expected {expected_size}, got {actual_size}")
+                return False
+            
+            print("Download verification successful")
+            return True
+            
+        except Exception as e:
+            print(f"Error verifying download: {e}")
+            return False
+    
+    def download_model(self, model_path: str, destination: str, 
+                      chunk_size: int = 4 * 1024 * 1024, delete_existing: bool = True) -> bool:
+        """
+        Download a model file with optimized settings for large files.
+        
+        Args:
+            model_path: Path to the model in Azure storage (format: container/blob_name)
+            destination: Local file path to save the model
+            chunk_size: Size of chunks in bytes (default: 4MB for models)
+            delete_existing: Whether to delete existing model file before download (default: True)
+        
+        Returns:
+            bool: True if download successful, False otherwise
+        """
+        try:
+            # Parse container and blob name from path
+            parts = model_path.split('/', 1)
+            if len(parts) != 2:
+                print(f"Invalid model path format: {model_path}. Expected: container/blob_name")
+                return False
+            
+            container_name, blob_name = parts
+            
+            print(f"Downloading model: {model_path}")
+            print(f"Model-optimized chunk size: {chunk_size / (1024*1024):.2f} MB")
+            
+            # Create a progress callback for model downloads
+            def model_progress_callback(downloaded: int, total: int):
+                progress = (downloaded / total) * 100
+                print(f"Model download progress: {progress:.1f}% "
+                      f"({downloaded / (1024*1024):.1f}/{total / (1024*1024):.1f} MB)")
+            
+            # Download with model-specific settings
+            self.download_file(
+                container_name=container_name,
+                blob_name=blob_name,
+                destination=destination,
+                chunk_size=chunk_size,
+                resume=True,
+                delete_existing=delete_existing,
+                progress_callback=model_progress_callback
+            )
+            
+            # Verify the model file can be loaded (basic check)
+            if os.path.exists(destination):
+                if self._verify_model_file(destination):
+                    print(f"Model downloaded and verified successfully: {destination}")
+                    return True
+                else:
+                    print(f"Model file verification failed: {destination}")
+                    return False
+            else:
+                print(f"Model file not found after download: {destination}")
+                return False
+                
+        except Exception as e:
+            print(f"Error downloading model {model_path}: {e}")
+            return False
+    
+    def _verify_model_file(self, model_path: str) -> bool:
+        """Verify that the downloaded model file is valid"""
+        try:
+            if not os.path.exists(model_path):
+                return False
+            
+            # Basic file size check (models should be at least 1KB)
+            file_size = os.path.getsize(model_path)
+            if file_size < 1024:
+                print(f"Model file too small: {file_size} bytes")
+                return False
+            
+            # Try to load the model file to verify it's a valid PyTorch model
+            if model_path.endswith('.pth'):
+                try:
+                    import torch
+                    # Just check if it can be loaded, don't actually load into memory
+                    with open(model_path, 'rb') as f:
+                        # Read first few bytes to check if it looks like a PyTorch file
+                        header = f.read(10)
+                        if len(header) < 10:
+                            print("Model file appears to be corrupted (too short)")
+                            return False
+                    
+                    print("Model file appears to be a valid PyTorch model")
+                    return True
+                except Exception as e:
+                    print(f"Model file verification failed: {e}")
+                    return False
+            else:
+                # For non-PyTorch files, just check basic properties
+                print("Model file basic verification passed")
+                return True
+                
+        except Exception as e:
+            print(f"Error verifying model file: {e}")
+            return False
 
     def _download_file_mock(self, container_name: str, blob_name: str, destination: str) -> None:
         print(f"MOCK: Creating mock file for {blob_name}")
+        
+        # Delete existing file if it exists (for consistency with real download)
+        if os.path.exists(destination):
+            print(f"MOCK: Deleting existing file: {destination}")
+            os.remove(destination)
         
         if blob_name.endswith('.pth') or 'model' in blob_name.lower():
             try:

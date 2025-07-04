@@ -98,10 +98,12 @@ class PredictionService:
     def load_model(self, model_path: str) -> None:
         try:
             print(f"Loading model from: {model_path}")
+            # Load model with weights_only=False for compatibility with models containing numpy objects
+            # This is safe since we trust our model files
             if self.device.type == 'cuda':
-                state_dict = torch.load(model_path, map_location=self.device)
+                state_dict = torch.load(model_path, map_location=self.device, weights_only=False)
             else:
-                state_dict = torch.load(model_path, map_location='cpu')
+                state_dict = torch.load(model_path, map_location='cpu', weights_only=False)
             print(f"Initializing model with backbone: googlenet for grayscale input")
             self.model = PrototypicalNetwork(backbone_name="googlenet", pretrained=True, device=self.device)
             self.model.to(self.device)
@@ -245,6 +247,8 @@ async def predict(request: TaskRequest) -> PredictionResponse:
     Execute writer identification task by calling external API for execution info
     and then performing the identification process
     """
+    import shutil  # Import at function level to ensure it's available in cleanup
+    
     try:
         # Get task execution information from external API
         print(f"Task Id: {request.task_id}")
@@ -281,7 +285,6 @@ async def predict(request: TaskRequest) -> PredictionResponse:
                 # Copy to task directory
                 model_path = os.path.join(task_work_dir, "model.pth")
                 try:
-                    import shutil
                     shutil.copy2(local_default_model, model_path)
                     print(f"Default model copied to: {model_path}")
                 except Exception as e:
@@ -298,7 +301,7 @@ async def predict(request: TaskRequest) -> PredictionResponse:
                     # Assuming model file is named model.pth in the container
                     prediction_service.azure_client.download_file(
                         execution_info.modelContainerName,
-                        "model.pth",
+                        "best_model.pth",
                         model_path
                     )
                     print(f"Specific model downloaded successfully to: {model_path}")
