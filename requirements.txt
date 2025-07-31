@@ -1,12 +1,34 @@
+# Web Framework
 fastapi==0.104.1
-uvicorn==0.24.0
+uvicorn[standard]==0.24.0
+pydantic==2.5.2
+
+# HTTP and Networking
 requests==2.31.0
+urllib3==2.1.0
+
+# Cloud Storage
 azure-storage-blob==12.17.0
+
+# Environment and Configuration
 python-dotenv==1.0.0
+
+# Machine Learning and Deep Learning
 # PyTorch with CUDA support - install with: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
 torch==2.7.1
 torchvision==0.20.1
-pydantic==2.5.2
+
+# Image Processing
 pillow==10.1.0
+
+# Numerical Computing
 numpy==1.24.3
-urllib3==2.1.0 
+
+# Development and Testing (optional)
+# pytest==7.4.3
+# pytest-asyncio==0.21.1
+# httpx==0.25.2
+
+# Documentation (optional)
+# mkdocs==1.5.3
+# mkdocs-material==9.4.8 
